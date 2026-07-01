@@ -5,7 +5,9 @@ Tento balíček do Home Assistantu udělá z obyčejné chytré zásuvky **chytr
 - spočítá, kolik energie a času potřebuješ na dobití,
 - **„Quick Charge"** = nabij hned na 80 %,
 - **„Na 100 % k odjezdu"** = nabij hned na 80 % a zbytek do 100 % načasuj přesně na čas odjezdu (šetří baterii),
-- sám vypne zásuvku po dosažení cíle,
+- **„Manuální režim"** = tupé zapnutí/vypnutí; HA nezasahuje, jen zobrazuje chytré výpočty (SOC, ETA na 100 %, spotřeba),
+- sám vypne zásuvku po dosažení cíle (v režimech Quick/Plánovaně),
+- při **ručním přerušení** uloží reálný dosažený SOC (nespadne zpět na start),
 - ukáže cenu, měsíční/roční spotřebu a odhad dojezdu v km,
 - hlásí stav do telefonu a (volitelně) nahlas přes reproduktor.
 
@@ -121,40 +123,66 @@ sections:
           - { from: 20, color: "#0f9d58" }
           - { from: 80, color: "#f4b400" }
           - { from: 100, color: "#0f9d58" }
-      - type: vertical-stack
-        cards:
-          - type: entities
-            entities:
-              - entity: sensor.ev_dojezd_km
-                name: Dojezd
-                icon: mdi:map-marker-distance
-              - entity: input_number.ev_soc_current
-                name: Aktuální SOC (zadej)
-          - type: button
-            name: Quick Charge → 80 %
-            icon: mdi:flash
-            icon_height: 38px
-            show_state: false
-            tap_action:
-              action: perform-action
-              perform_action: script.ev_quick_charge
-          - type: horizontal-stack
-            cards:
-              - type: button
-                name: Na 100 % k odjezdu
-                icon: mdi:calendar-clock
-                icon_height: 32px
-                show_state: false
-                tap_action:
-                  action: perform-action
-                  perform_action: script.ev_charge_100_by_departure
-              - type: entities
-                entities:
-                  - entity: input_datetime.ev_ready_time
-                    name: Odjezd
+      # aktuální režim – zobrazí se jen když nabíjení běží
+      - type: tile
+        entity: input_select.ev_mode
+        name: Aktuální režim
+        icon: mdi:ev-station
+        visibility:
+          - condition: state
+            entity: binary_sensor.ev_charging
+            state: "on"
+      - type: entities
+        entities:
+          - entity: sensor.ev_dojezd_km
+            name: Dojezd
+            icon: mdi:map-marker-distance
+          - entity: input_number.ev_soc_current
+            name: Aktuální SOC (zadej)
+      # ⚡ Rychlé nabití na 80 %
+      - type: tile
+        entity: script.ev_quick_charge
+        name: ⚡ Nabij hned na 80 %
+        icon: mdi:flash
+        hide_state: true
+        vertical: true
+        tap_action:
+          action: perform-action
+          perform_action: script.ev_quick_charge
+      - type: entities
+        entities:
+          - entity: input_datetime.ev_ready_time
+            name: Čas odjezdu
+      # 🕐 Na 100 % k odjezdu (dvoufázově)
+      - type: tile
+        entity: script.ev_charge_100_by_departure
+        name: 🕐 Na 100 % k odjezdu
+        icon: mdi:calendar-clock
+        hide_state: true
+        vertical: true
+        tap_action:
+          action: perform-action
+          perform_action: script.ev_charge_100_by_departure
+      # 🔧 Manuální režim (tupé zapnutí)
+      - type: tile
+        entity: input_select.ev_mode
+        name: 🔧 Manuální nabíjení
+        icon: mdi:hand-back-right
+        hide_state: true
+        vertical: true
+        tap_action:
+          action: perform-action
+          perform_action: input_select.select_option
+          target:
+            entity_id: input_select.ev_mode
+          data:
+            option: Manual
       - type: entities
         title: Detail
         entities:
+          - entity: sensor.ZASUVKA_vykon
+            name: Aktuální výkon
+            icon: mdi:flash-outline
           - entity: sensor.ev_session_delivered_kwh
             name: Dodáno
           - entity: sensor.ev_kwh_needed
@@ -164,7 +192,9 @@ sections:
           - entity: sensor.ev_remaining_text
             name: Zbývá
           - entity: sensor.ev_eta
-            name: ETA
+            name: ETA (na cíl)
+          - entity: sensor.ev_eta_100
+            name: Hotovo na 100 %
           - entity: binary_sensor.ev_charging
             name: Nabíjení běží
   - type: grid
@@ -229,13 +259,22 @@ sections:
 
 > 🔋 **Proč dvě fáze?** Baterie nerada stojí dlouho nabitá na 100 %. Tímto je na 100 % až těsně před jízdou.
 
+### C) Manuální nabíjení (tupé zap/vyp)
+1. (Volitelně) posuň slider **„Aktuální SOC"** na reálný stav, ať sedí výpočty.
+2. Zmáčkni **„Manuální nabíjení"** → zásuvka se **tupě zapne** a HA do toho **nezasahuje**.
+3. Během nabíjení vidíš živě SOC, dojezd, **ETA na 100 %**, dodané kWh i cenu.
+4. **Vypneš ručně** (dlaždicí zásuvky / vypínačem) → automaticky se **uloží reálný dosažený SOC** a režim se vrátí na „Off".
+
+> 🔧 Manuál je pro případ, kdy chceš mít plnou kontrolu (např. nabít na přesně tolik, kolik zrovna chceš, bez cíle) – chytré výpočty ti přitom pořád běží jako přehled.
+
 ---
 
 ## Důležité vědět
 
 - **Vždy nastav reálný „Aktuální SOC"** před spuštěním. Z toho se počítá, kdy přestat. Když ho necháš špatně, nabití nebude přesné.
 - Systém **neví**, kolik je v autě doopravdy (Ioniq to po kabelu neposílá). Pracuje s odhadem podle dodané energie. Po pár nabíjeních si můžeš doladit přesnost (viz níže).
-- Po dosažení cíle se zásuvka **sama vypne** a režim se vrátí na „Off".
+- Po dosažení cíle se zásuvka **sama vypne** a režim se vrátí na „Off" (v režimech Quick / Plánovaně).
+- **Přerušíš-li nabíjení ručně** (třeba když přijde bouřka), uloží se skutečný dosažený SOC – hodnota nespadne zpět na startovní. Platí pro všechny režimy.
 
 ---
 
@@ -258,7 +297,9 @@ Obdobně `eff_above_80` pro pásmo 80–100 %. Po úpravě restartuj nebo *Vývo
 | `sensor.ev_estimated_soc` je „neznámé" | Šablony se ještě nenačetly – restartuj, nebo *Vývojářské nástroje → YAML → Znovu načíst šablony*. |
 | Tlačítko nic nedělá | Ověř, že existují `script.ev_quick_charge` a `script.ev_charge_100_by_departure` (*Nastavení → Automatizace a scény → Skripty*). |
 | Nabíjí přes cíl | Měl/a jsi „Aktuální SOC" stejný nebo vyšší než cíl → nebylo co nabíjet. Nastav reálnou (nižší) hodnotu. |
-| Graf výkonu je prázdný | V dashboardu jsi nepřepsal/a `sensor.ZASUVKA_vykon` za svůj senzor. |
+| Graf výkonu / aktuální výkon je prázdný | V dashboardu jsi nepřepsal/a `sensor.ZASUVKA_vykon` za svůj senzor. |
+| Chybí režim „Manual" ve výběru | Po úpravě jsi nereloadoval/a. Udělej *Vývojářské nástroje → YAML → Input select*, nebo restartuj. |
+| „Aktuální režim" na dashboardu se neukazuje | To je záměr – zobrazí se **jen když nabíjení běží**. |
 
 ---
 
@@ -268,9 +309,11 @@ Obdobně `eff_above_80` pro pásmo 80–100 %. Po úpravě restartuj nebo *Vývo
 
 **Skripty:** `script.ev_quick_charge`, `script.ev_charge_100_by_departure`
 
-**Senzory:** `sensor.ev_estimated_soc`, `sensor.ev_dojezd_km`, `sensor.ev_kwh_needed`, `sensor.ev_duration_text`, `sensor.ev_planned_start`, `sensor.ev_session_delivered_kwh`, `sensor.ev_session_cost_czk`, `sensor.ev_remaining_text`, `sensor.ev_eta`, `sensor.ev_monthly_kwh_display`, `sensor.ev_monthly_cost_czk`, `sensor.ev_yearly_cost_czk`, `binary_sensor.ev_charging`
+**Senzory:** `sensor.ev_estimated_soc`, `sensor.ev_dojezd_km`, `sensor.ev_kwh_needed`, `sensor.ev_duration_text`, `sensor.ev_planned_start`, `sensor.ev_session_delivered_kwh`, `sensor.ev_session_cost_czk`, `sensor.ev_remaining_text`, `sensor.ev_eta`, `sensor.ev_eta_100`, `sensor.ev_monthly_kwh_display`, `sensor.ev_monthly_cost_czk`, `sensor.ev_yearly_cost_czk`, `binary_sensor.ev_charging`
 
-**Automatizace:** start hned, start naplánovaně, vypnutí na cíli, hlášky 80/100 %, failsafe.
+**Režimy** (`input_select.ev_mode`): Off, Charge now, Scheduled, **Manual**.
+
+**Automatizace:** start hned, start naplánovaně, vypnutí na cíli (Manual ignoruje), hlášky 80/100 %, failsafe, **manuální start**, **uložení SOC při přerušení**.
 
 ---
 
