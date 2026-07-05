@@ -65,7 +65,7 @@ A pro notifikace svůj telefon (musíš mít appku **Home Assistant Companion** 
 
 ## Krok 3 – Nahraj šablonu a přepiš názvy
 
-1. Soubor **`ioniq_ev_charging_template.yaml`** zkopíruj do složky `packages/`.
+1. Soubor **`IONIQ_EV_charging_CZ.yaml`** zkopíruj do složky `packages/`.
 2. Otevři ho a udělej **„Najít a nahradit"** (ve Studio Code Server: `Ctrl+H`). Nahraď tyto texty za své entity z Kroku 1:
 
    | Najít (token) | Nahradit za |
@@ -314,6 +314,16 @@ Obdobně `eff_above_80` pro pásmo 80–100 %. Po úpravě restartuj nebo *Vývo
 **Režimy** (`input_select.ev_mode`): Off, Charge now, Scheduled, **Manual**.
 
 **Automatizace:** start hned, start naplánovaně, vypnutí na cíli (Manual ignoruje), hlášky 80/100 %, failsafe, **manuální start**, **uložení SOC při přerušení**.
+
+---
+
+## Changelog
+
+- **v1.2 (2026-07-05)** – Oprava: baseline session se nastaví při ZAPNUTÍ zásuvky (ne při výkonu >50 W); krátká pauza uprostřed nabíjení už nevynuluje počítadlo (dřív způsobovala přebití). Odladěno měřením: účinnost do 80 % = 0,95, nabíjecí výkon = 2,12 kW.
+- **v1.1 (2026-06)** – Přidán Manuální režim + senzor ETA na 100 %; uložení reálného SOC při ručním přerušení; stop-on-target ignoruje Manuál.
+- **v1.0 (2026-05)** – Základ: Quick Charge, dvoufázové nabíjení na 100 % k odjezdu, SOC/cena/dojezd, měsíční/roční spotřeba, failsafe.
+
+> 🇬🇧 **English version:** `IONIQ_EV_charging_guide_EN.md` + `IONIQ_EV_charging_EN.yaml`
 
 ---
 

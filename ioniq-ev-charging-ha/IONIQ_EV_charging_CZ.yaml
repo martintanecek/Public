@@ -1,0 +1,729 @@
+# =============================================================================
+#  CHYTRÉ NABÍJENÍ — Hyundai Ioniq Electric (28 kWh)  —  ŠABLONA pro Home Assistant
+# =============================================================================
+#
+#  Co to umí:
+#   - Spočítá, kolik energie a času je potřeba pro nabití z aktuálního na cílový SOC
+#   - "Quick Charge" = nabij hned na 80 %
+#   - "Na 100 % k odjezdu" = nabij hned na 80 %, zbytek do 100 % načasuj na čas odjezdu
+#   - "Manual" = tupé zap/vyp, HA nezasahuje, jen zobrazuje výpočty (+ ETA na 100 %)
+#   - Hlídá cíl a sám vypne zásuvku (i 15min kalibrace při 100 %)
+#   - Při ručním přerušení uloží reálný dosažený SOC (nespadne na start)
+#   - Počítá cenu, měsíční/roční spotřebu, odhad dojezdu v km
+#   - Hlasové hlášky (TTS) a notifikace do telefonu
+#
+# -----------------------------------------------------------------------------
+#  CHANGELOG
+# -----------------------------------------------------------------------------
+#  v1.2 (2026-07-05)
+#   - Oprava: baseline session se nastaví při ZAPNUTÍ zásuvky (ne při výkonu >50 W).
+#     Dřív krátká pauza odběru uprostřed nabíjení vynulovala počítadlo -> přebití.
+#   - Odladěno měřením: účinnost do 80 % = 0.95 (5 % ztrát), nabíjecí výkon = 2.12 kW.
+#  v1.1 (2026-06)
+#   - Přidán Manuální režim (tupé zap/vyp) + senzor ETA na 100 %.
+#   - Přidáno automatické uložení reálného SOC při ručním přerušení nabíjení.
+#   - "EV stop on target" nově ignoruje Manuální režim.
+#  v1.0 (2026-05)
+#   - Základ: Quick Charge (80 %), dvoufázové nabíjení na 100 % k odjezdu,
+#     výpočet SOC/ceny/dojezdu, měsíční/roční spotřeba, failsafe.
+#
+# -----------------------------------------------------------------------------
+#  JAK TO POUŽÍT (3 kroky — podrobně viz IONIQ_EV_charging_guide_CZ.md):
+# -----------------------------------------------------------------------------
+#  1) V editoru udělej "Find & Replace" (Najít a nahradit) těchto tokenů:
+#
+#       switch.ZASUVKA          ->  tvoje chytrá zásuvka (on/off),  např. switch.nabijecka
+#       sensor.ZASUVKA_vykon    ->  senzor okamžitého výkonu ve W,  např. sensor.nabijecka_power
+#       notify.MUJ_TELEFON      ->  notifikace do tvého mobilu,     např. notify.mobile_app_pixel
+#       media_player.MUJ_REPRO  ->  (volitelné) reproduktor pro TTS
+#       tts.MUJ_TTS             ->  (volitelné) TTS služba, např. tts.google_translate_cs
+#
+#     (Pokud nemáš reproduktor/TTS, řádky s "tts.speak" prostě smaž.)
+#
+#  2) Konstanty auta NEMUSÍŠ měnit (jsou pro Ioniq 28 kWh). Pokud máš jiný
+#     nabíjecí výkon, uprav je dole v "sensor: EV config".
+#
+#  3) Soubor ulož do /config/packages/ a v configuration.yaml měj zapnuté balíčky:
+#         homeassistant:
+#           packages: !include_dir_named packages
+#     Pak restartuj Home Assistant.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1) POMOCNÍCI (vstupy od uživatele)
+# -----------------------------------------------------------------------------
+input_number:
+  ev_soc_current:
+    name: EV SOC aktuální
+    min: 0
+    max: 100
+    step: 1
+    mode: slider
+    unit_of_measurement: '%'
+    icon: mdi:battery-50
+
+  ev_soc_target:
+    name: EV SOC cíl
+    min: 50
+    max: 100
+    step: 5
+    initial: 80
+    mode: slider
+    unit_of_measurement: '%'
+    icon: mdi:battery-charging-100
+
+  ev_price_czk:
+    name: EV cena za kWh
+    min: 0
+    max: 30
+    step: 0.01
+    initial: 6.0          # <<< nastav si svou cenu elektřiny (Kč/kWh) v UI
+    mode: box
+    unit_of_measurement: 'Kč'
+    icon: mdi:cash
+
+input_datetime:
+  ev_ready_time:
+    name: EV hotovo v (odjezd)
+    has_date: false
+    has_time: true
+
+input_select:
+  ev_mode:
+    name: EV režim
+    options:
+      - 'Off'
+      - 'Charge now'
+      - 'Scheduled'
+      - 'Manual'
+    initial: 'Off'
+    icon: mdi:ev-station
+
+input_button:
+  ev_reset_session:
+    name: EV reset session
+    icon: mdi:restart
+
+input_boolean:
+  ev_finish_to_100:
+    name: EV dofázovat na 100
+    icon: mdi:battery-charging-100
+
+
+# -----------------------------------------------------------------------------
+# 2) INTEGRACE VÝKONU -> kumulativní spotřeba (kWh) z výkonu (W)
+#    Potřebuje POUZE senzor výkonu. Energii dopočítá HA sám.
+# -----------------------------------------------------------------------------
+sensor:
+  - platform: integration
+    source: sensor.ZASUVKA_vykon
+    name: ev_energy_session
+    unique_id: ev_energy_session
+    unit_prefix: k
+    method: trapezoidal
+    round: 3
+
+
+# -----------------------------------------------------------------------------
+# 3) MĚŘENÍ po měsících / letech
+# -----------------------------------------------------------------------------
+utility_meter:
+  ev_monthly_energy:
+    source: sensor.ev_energy_session
+    cycle: monthly
+    name: EV monthly kWh
+  ev_yearly_energy:
+    source: sensor.ev_energy_session
+    cycle: yearly
+    name: EV yearly kWh
+
+
+# -----------------------------------------------------------------------------
+# 4) VÝPOČETNÍ LOGIKA
+# -----------------------------------------------------------------------------
+template:
+  # ===== KONFIGURACE AUTA (jediné místo s konstantami) =====
+  - sensor:
+      - name: "EV config"
+        unique_id: ev_config
+        state: "OK"
+        icon: mdi:cog
+        attributes:
+          battery_kwh: "28"        # kapacita baterie (kWh)
+          charger_kw: "2.12"       # nabíjecí výkon (kW) – změřeno na zásuvce (avg ~2121 W)
+          eff_below_80: "0.95"     # účinnost do 80 % (5 % ztrát) – odladěno měřením
+          eff_above_80: "0.80"     # účinnost 80–100 % (20 % ztrát)
+          range_km_at_100: "215"   # dojezd při 100 % (km)
+          calibration_min: "15"    # kalibrace BMS na 100 % (min)
+
+  # ===== Snapshot startovní kWh (start nabíjení / manuální reset) =====
+  # POZOR: spouští se při ZAPNUTÍ zásuvky, NE na "výkon > 50 W". Jinak by krátká
+  # pauza odběru uprostřed nabíjení (auto na pár sekund přeruší) vynulovala baseline
+  # a nabilo by se 2× víc, než je potřeba.
+  - trigger:
+      - trigger: state
+        entity_id: switch.ZASUVKA
+        to: "on"
+      - trigger: state
+        entity_id: input_button.ev_reset_session
+    sensor:
+      - name: "ev_session_start_kwh"
+        unique_id: ev_session_start_kwh
+        state: "{{ states('sensor.ev_energy_session') | float(0) }}"
+        unit_of_measurement: kWh
+
+  - sensor:
+      # ---- Kolik kWh dodat (vč. ztrát) z current -> target ----
+      - name: "EV kWh needed"
+        unique_id: ev_kwh_needed
+        unit_of_measurement: "kWh"
+        icon: mdi:flash
+        state: >-
+          {% set cfg = 'sensor.ev_config' %}
+          {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.92) %}
+          {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+          {% set x = states('input_number.ev_soc_current') | float(0) %}
+          {% set t = states('input_number.ev_soc_target') | float(80) %}
+          {% set pct = batt / 100 %}
+          {% set ns = namespace(kwh=0) %}
+          {% if x < 80 and t > x %}
+            {% set upper = [t, 80] | min %}
+            {% set ns.kwh = ns.kwh + (upper - x) * pct / eff_lo %}
+          {% endif %}
+          {% if t > 80 %}
+            {% set lower = [x, 80] | max %}
+            {% set ns.kwh = ns.kwh + (t - lower) * pct / eff_hi %}
+          {% endif %}
+          {{ ns.kwh | round(2) }}
+
+      # ---- Délka nabíjení v minutách ----
+      - name: "EV duration min"
+        unique_id: ev_duration_min
+        unit_of_measurement: "min"
+        icon: mdi:clock-outline
+        state: >-
+          {% set cfg = 'sensor.ev_config' %}
+          {% set kw = state_attr(cfg,'charger_kw') | float(2.14) %}
+          {% set calib = state_attr(cfg,'calibration_min') | float(15) %}
+          {% set kwh = states('sensor.ev_kwh_needed') | float(0) %}
+          {% set t = states('input_number.ev_soc_target') | float(80) %}
+          {% set m = kwh / kw * 60 %}
+          {% if t >= 100 %}{% set m = m + calib %}{% endif %}
+          {{ m | round(0) }}
+
+      # ---- Délka jako text "Xh Ymin" ----
+      - name: "EV duration text"
+        unique_id: ev_duration_text
+        icon: mdi:clock-outline
+        state: >-
+          {% set m = states('sensor.ev_duration_min') | float(0) | round(0) | int %}
+          {% set h = m // 60 %}{% set rem = m % 60 %}
+          {% if h > 0 %}{{ h }} h {{ rem }} min{% else %}{{ rem }} min{% endif %}
+
+      # ---- Plánovaný čas startu = odjezd - délka ----
+      - name: "EV planned start"
+        unique_id: ev_planned_start
+        icon: mdi:clock-start
+        state: >-
+          {% set ready = states('input_datetime.ev_ready_time') %}
+          {% set duration = states('sensor.ev_duration_min') | float(0) %}
+          {% if ready in ['unknown','unavailable','none'] or duration == 0 %}
+            unknown
+          {% else %}
+            {% set today_ready = today_at(ready) %}
+            {% if today_ready < now() %}{% set today_ready = today_ready + timedelta(days=1) %}{% endif %}
+            {{ (today_ready - timedelta(minutes=duration)).strftime('%H:%M') }}
+          {% endif %}
+
+      # ---- Dodaná energie v aktuální session ----
+      - name: "EV session delivered kWh"
+        unique_id: ev_session_delivered_kwh
+        unit_of_measurement: "kWh"
+        icon: mdi:battery-plus
+        state: >-
+          {% set total = states('sensor.ev_energy_session') | float(0) %}
+          {% set start = states('sensor.ev_session_start_kwh') | float(0) %}
+          {{ [0, total - start] | max | round(3) }}
+
+      # ---- Odhadovaný aktuální SOC (přičítá dodané kWh jen při nabíjení) ----
+      - name: "EV estimated SOC"
+        unique_id: ev_estimated_soc
+        unit_of_measurement: "%"
+        icon: mdi:battery-heart
+        state: >-
+          {% set cfg = 'sensor.ev_config' %}
+          {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.92) %}
+          {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+          {% set start_soc = states('input_number.ev_soc_current') | float(0) %}
+          {% set pct = batt / 100 %}
+          {% set ns = namespace(added=0, remaining_kwh=0) %}
+          {% if is_state('binary_sensor.ev_charging','on') %}
+            {% set ns.remaining_kwh = states('sensor.ev_session_delivered_kwh') | float(0) %}
+            {% if start_soc < 80 %}
+              {% set cap_low = (80 - start_soc) * pct / eff_lo %}
+              {% if ns.remaining_kwh <= cap_low %}
+                {% set ns.added = ns.remaining_kwh * eff_lo / pct %}
+                {% set ns.remaining_kwh = 0 %}
+              {% else %}
+                {% set ns.added = 80 - start_soc %}
+                {% set ns.remaining_kwh = ns.remaining_kwh - cap_low %}
+              {% endif %}
+            {% endif %}
+            {% if ns.remaining_kwh > 0 %}
+              {% set ns.added = ns.added + ns.remaining_kwh * eff_hi / pct %}
+            {% endif %}
+          {% endif %}
+          {{ [start_soc + ns.added, 100] | min | round(1) }}
+
+      # ---- Zbývající minuty ----
+      - name: "EV remaining min"
+        unique_id: ev_remaining_min
+        unit_of_measurement: "min"
+        icon: mdi:timer-sand
+        state: >-
+          {% set duration = states('sensor.ev_duration_min') | float(0) %}
+          {% set delivered = states('sensor.ev_session_delivered_kwh') | float(0) %}
+          {% set needed = states('sensor.ev_kwh_needed') | float(0) %}
+          {% if needed == 0 %}0{% else %}{{ [0, duration * (1 - delivered / needed)] | max | round(0) }}{% endif %}
+
+      # ---- Zbývající čas jako text ----
+      - name: "EV remaining text"
+        unique_id: ev_remaining_text
+        icon: mdi:timer-sand
+        state: >-
+          {% set m = states('sensor.ev_remaining_min') | float(0) | round(0) | int %}
+          {% set h = m // 60 %}{% set rem = m % 60 %}
+          {% if h > 0 %}{{ h }} h {{ rem }} min{% else %}{{ rem }} min{% endif %}
+
+      # ---- ETA dokončení ----
+      - name: "EV ETA"
+        unique_id: ev_eta
+        icon: mdi:flag-checkered
+        state: >-
+          {% set remaining = states('sensor.ev_remaining_min') | float(0) %}
+          {% if is_state('binary_sensor.ev_charging','on') and remaining > 0 %}
+            {{ (now() + timedelta(minutes=remaining)).strftime('%H:%M') }}
+          {% else %}—{% endif %}
+
+      # ---- ETA na 100 % (podle AKTUÁLNÍHO výkonu) – užitečné v Manuálním režimu ----
+      - name: "EV ETA 100"
+        unique_id: ev_eta_100
+        icon: mdi:battery-charging-100
+        state: >-
+          {% set cfg = 'sensor.ev_config' %}
+          {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.92) %}
+          {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+          {% set calib = state_attr(cfg,'calibration_min') | float(15) %}
+          {% set soc = states('sensor.ev_estimated_soc') | float(0) %}
+          {% set power_kw = states('sensor.ZASUVKA_vykon') | float(0) / 1000 %}
+          {% if is_state('binary_sensor.ev_charging','on') and soc < 100 and power_kw > 0.2 %}
+            {% set pct = batt / 100 %}
+            {% set ns = namespace(kwh=0) %}
+            {% if soc < 80 %}{% set ns.kwh = ns.kwh + (80 - soc) * pct / eff_lo %}{% endif %}
+            {% set ns.kwh = ns.kwh + (100 - [soc, 80] | max) * pct / eff_hi %}
+            {% set mins = ns.kwh / power_kw * 60 + calib %}
+            {{ (now() + timedelta(minutes=mins)).strftime('%H:%M') }}
+          {% else %}—{% endif %}
+
+      # ---- Dojezd v km ----
+      - name: "EV dojezd km"
+        unique_id: ev_dojezd_km
+        unit_of_measurement: "km"
+        icon: mdi:map-marker-distance
+        state: >-
+          {% set range = state_attr('sensor.ev_config','range_km_at_100') | float(215) %}
+          {% set soc = states('sensor.ev_estimated_soc') | float(0) %}
+          {{ (soc * range / 100) | round(0) }}
+
+      # ---- Cena aktuální session ----
+      - name: "EV session cost CZK"
+        unique_id: ev_session_cost_czk
+        unit_of_measurement: "Kč"
+        icon: mdi:cash
+        state: >-
+          {% set kwh = states('sensor.ev_session_delivered_kwh') | float(0) %}
+          {% set cena = states('input_number.ev_price_czk') | float(0) %}
+          {{ (kwh * cena) | round(2) }}
+
+      # ---- Měsíční / roční spotřeba (zaokrouhleno) ----
+      - name: "EV monthly kWh display"
+        unique_id: ev_monthly_kwh_display
+        unit_of_measurement: "kWh"
+        icon: mdi:calendar-month
+        state: "{{ states('sensor.ev_monthly_kwh') | float(0) | round(2) }}"
+
+      - name: "EV yearly kWh display"
+        unique_id: ev_yearly_kwh_display
+        unit_of_measurement: "kWh"
+        icon: mdi:calendar
+        state: "{{ states('sensor.ev_yearly_kwh') | float(0) | round(2) }}"
+
+      # ---- Měsíční / roční náklady ----
+      - name: "EV monthly cost CZK"
+        unique_id: ev_monthly_cost_czk
+        unit_of_measurement: "Kč"
+        icon: mdi:cash-multiple
+        state: >-
+          {{ (states('sensor.ev_monthly_kwh') | float(0) * states('input_number.ev_price_czk') | float(0)) | round(2) }}
+
+      - name: "EV yearly cost CZK"
+        unique_id: ev_yearly_cost_czk
+        unit_of_measurement: "Kč"
+        icon: mdi:cash-multiple
+        state: >-
+          {{ (states('sensor.ev_yearly_kwh') | float(0) * states('input_number.ev_price_czk') | float(0)) | round(2) }}
+
+  - binary_sensor:
+      # ---- Probíhá nabíjení? (výkon > 100 W déle než 30 s) ----
+      - name: "EV charging"
+        unique_id: ev_charging
+        device_class: power
+        icon: mdi:ev-station
+        state: "{{ states('sensor.ZASUVKA_vykon') | float(0) > 100 }}"
+        delay_on:
+          seconds: 30
+        delay_off:
+          seconds: 30
+
+
+# -----------------------------------------------------------------------------
+# 5) SKRIPTY (tlačítka na dashboardu)
+# -----------------------------------------------------------------------------
+script:
+  ev_quick_charge:
+    alias: EV Quick Charge
+    icon: mdi:flash
+    mode: single
+    sequence:
+      - action: input_number.set_value
+        target: { entity_id: input_number.ev_soc_target }
+        data: { value: 80 }
+      - action: input_select.select_option
+        target: { entity_id: input_select.ev_mode }
+        data: { option: "Charge now" }
+
+  ev_charge_100_by_departure:
+    alias: EV charge 100 by departure
+    icon: mdi:calendar-clock
+    mode: single
+    sequence:
+      - choose:
+          - conditions:
+              - condition: numeric_state
+                entity_id: input_number.ev_soc_current
+                below: 80
+            sequence:
+              - action: input_boolean.turn_on
+                target: { entity_id: input_boolean.ev_finish_to_100 }
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_target }
+                data: { value: 80 }
+              - action: input_select.select_option
+                target: { entity_id: input_select.ev_mode }
+                data: { option: "Charge now" }
+        default:
+          - action: input_boolean.turn_off
+            target: { entity_id: input_boolean.ev_finish_to_100 }
+          - action: input_number.set_value
+            target: { entity_id: input_number.ev_soc_target }
+            data: { value: 100 }
+          - action: input_select.select_option
+            target: { entity_id: input_select.ev_mode }
+            data: { option: "Scheduled" }
+
+
+# -----------------------------------------------------------------------------
+# 6) AUTOMATIZACE
+# -----------------------------------------------------------------------------
+automation:
+  # ===== Start hned (Charge now) =====
+  - id: ev_tpl_start_now
+    alias: EV start now
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: input_select.ev_mode
+        to: "Charge now"
+    conditions:
+      - condition: state
+        entity_id: switch.ZASUVKA
+        state: "off"
+    actions:
+      - choose:
+          - conditions:
+              - condition: numeric_state
+                entity_id: sensor.ev_kwh_needed
+                above: 0
+            sequence:
+              - action: switch.turn_on
+                target: { entity_id: switch.ZASUVKA }
+              - action: notify.MUJ_TELEFON
+                data:
+                  title: "⚡ Nabíjení zahájeno"
+                  message: "Cíl {{ states('input_number.ev_soc_target') }} %, předpoklad {{ states('sensor.ev_duration_min') }} min"
+              # volitelné TTS:
+              - action: tts.speak
+                target: { entity_id: tts.MUJ_TTS }
+                data:
+                  cache: true
+                  media_player_entity_id: media_player.MUJ_REPRO
+                  language: cs
+                  message: "Nabíjení zahájeno. Předpoklad {{ states('sensor.ev_duration_min') }} minut."
+        default:
+          - action: notify.MUJ_TELEFON
+            data:
+              title: "Není co nabíjet"
+              message: "Aktuální SOC ({{ states('input_number.ev_soc_current') }} %) už dosahuje cíle ({{ states('input_number.ev_soc_target') }} %)."
+          - action: input_select.select_option
+            target: { entity_id: input_select.ev_mode }
+            data: { option: "Off" }
+
+  # ===== Start naplánovaně (Scheduled) =====
+  - id: ev_tpl_start_scheduled
+    alias: EV start scheduled
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: "/1"
+    conditions:
+      - condition: state
+        entity_id: input_select.ev_mode
+        state: "Scheduled"
+      - condition: state
+        entity_id: switch.ZASUVKA
+        state: "off"
+      - condition: numeric_state
+        entity_id: sensor.ev_kwh_needed
+        above: 0
+      - condition: template
+        value_template: "{{ now().strftime('%H:%M') == states('sensor.ev_planned_start') }}"
+    actions:
+      - action: switch.turn_on
+        target: { entity_id: switch.ZASUVKA }
+      - action: notify.MUJ_TELEFON
+        data:
+          title: "⚡ Nabíjení zahájeno (plán)"
+          message: "Cíl {{ states('input_number.ev_soc_target') }} %, hotovo v {{ states('input_datetime.ev_ready_time')[:5] }}"
+      - action: tts.speak
+        target: { entity_id: tts.MUJ_TTS }
+        data:
+          cache: true
+          media_player_entity_id: media_player.MUJ_REPRO
+          language: cs
+          message: "Nabíjení zahájeno, hotovo v {{ states('input_datetime.ev_ready_time')[:5] }}."
+
+  # ===== Vypnutí po dosažení cíle (+ dvoufázový přechod 80->100) =====
+  - id: ev_tpl_stop_on_target
+    alias: EV stop on target
+    mode: single
+    triggers:
+      - trigger: template
+        value_template: >-
+          {{ (states('sensor.ev_session_delivered_kwh') | float(0)) >= (states('sensor.ev_kwh_needed') | float(99999))
+             and (states('sensor.ev_kwh_needed') | float(0)) > 0 }}
+      - trigger: template
+        value_template: >-
+          {{ is_state('switch.ZASUVKA','on')
+             and (is_state('input_select.ev_mode','Charge now') or is_state('input_select.ev_mode','Scheduled'))
+             and (states('sensor.ev_kwh_needed') | float(1)) <= 0 }}
+    conditions:
+      - condition: state
+        entity_id: switch.ZASUVKA
+        state: "on"
+      # Manuální režim IGNORUJE (auto-stop se ho netýká)
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: input_select.ev_mode
+            state: "Charge now"
+          - condition: state
+            entity_id: input_select.ev_mode
+            state: "Scheduled"
+    actions:
+      # 15min kalibrace jen při cíli 100 %
+      - choose:
+          - conditions:
+              - condition: numeric_state
+                entity_id: input_number.ev_soc_target
+                above: 99
+            sequence:
+              - action: notify.MUJ_TELEFON
+                data:
+                  title: "⏳ Kalibrace 15 min"
+                  message: "Dosaženo {{ states('sensor.ev_session_delivered_kwh') }} kWh, kalibrace do {{ (now() + timedelta(minutes=15)).strftime('%H:%M') }}"
+              - delay: { minutes: 15 }
+      - action: switch.turn_off
+        target: { entity_id: switch.ZASUVKA }
+      # přechod fáze 1 (80) -> fáze 2 (100 k odjezdu), nebo normální dokončení
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.ev_finish_to_100
+                state: "on"
+              - condition: numeric_state
+                entity_id: input_number.ev_soc_target
+                below: 100
+            sequence:
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_current }
+                data: { value: 80 }
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_target }
+                data: { value: 100 }
+              - action: input_select.select_option
+                target: { entity_id: input_select.ev_mode }
+                data: { option: "Scheduled" }
+              - action: notify.MUJ_TELEFON
+                data:
+                  title: "🔋 Fáze 1 hotová (80 %)"
+                  message: "Dofázování na 100 % naplánováno na {{ states('input_datetime.ev_ready_time')[:5] }} (start ~{{ states('sensor.ev_planned_start') }})."
+        default:
+          - action: input_select.select_option
+            target: { entity_id: input_select.ev_mode }
+            data: { option: "Off" }
+          - action: input_number.set_value
+            target: { entity_id: input_number.ev_soc_current }
+            data: { value: "{{ states('input_number.ev_soc_target') | float(80) }}" }
+          - action: input_boolean.turn_off
+            target: { entity_id: input_boolean.ev_finish_to_100 }
+
+  # ===== Hlášky při 80 % a 100 % =====
+  - id: ev_tpl_warn_milestones
+    alias: EV warn milestones
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.ev_estimated_soc
+        above: 80
+        id: "80"
+      - trigger: numeric_state
+        entity_id: sensor.ev_estimated_soc
+        above: 99.9
+        id: "100"
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.ev_charging
+        state: "on"
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: "80"
+            sequence:
+              - action: notify.MUJ_TELEFON
+                data:
+                  title: "🔋 80 %"
+                  message: "Nabito na 80 %. Dodáno {{ states('sensor.ev_session_delivered_kwh') }} kWh za {{ states('sensor.ev_session_cost_czk') }} Kč."
+          - conditions:
+              - condition: trigger
+                id: "100"
+            sequence:
+              - action: notify.MUJ_TELEFON
+                data:
+                  title: "🔋 100 %"
+                  message: "Plně nabito. Dodáno {{ states('sensor.ev_session_delivered_kwh') }} kWh za {{ states('sensor.ev_session_cost_czk') }} Kč."
+
+  # ===== Failsafe: zásuvka nabíjí, ale režim Off (typicky po restartu HA) =====
+  - id: ev_tpl_failsafe
+    alias: EV failsafe
+    mode: single
+    triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/10"
+    conditions:
+      - condition: state
+        entity_id: switch.ZASUVKA
+        state: "on"
+      - condition: state
+        entity_id: input_select.ev_mode
+        state: "Off"
+      - condition: numeric_state
+        entity_id: sensor.ZASUVKA_vykon
+        above: 50
+    actions:
+      - action: input_select.select_option
+        target: { entity_id: input_select.ev_mode }
+        data: { option: "Charge now" }
+      - action: notify.MUJ_TELEFON
+        data:
+          title: "EV failsafe"
+          message: "Detekováno nabíjení bez aktivního režimu. Přepínám na Charge now."
+
+  # ===== Manuální režim: tupě zapne zásuvku, HA do toho nezasahuje =====
+  - id: ev_tpl_manual_start
+    alias: EV manual start
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: input_select.ev_mode
+        to: "Manual"
+    conditions: []
+    actions:
+      - action: switch.turn_on
+        target: { entity_id: switch.ZASUVKA }
+      - action: notify.MUJ_TELEFON
+        data:
+          title: "🔧 Manuální nabíjení"
+          message: "Zásuvka zapnuta natvrdo. Vypni ji ručně, pak se uloží reálný SOC. HA do toho nezasahuje."
+
+  # ===== Uložení reálného SOC při přerušení (ruční vypnutí uprostřed) =====
+  # Když se zásuvka vypne během nabíjení (režim != Off, ne dvoufázové), zapíše
+  # skutečný dosažený SOC do ev_soc_current místo návratu na start. Platí i pro
+  # ruční vypnutí Manuálu. Normální dokončení (stop na cíli) se přeskočí – tam
+  # už je režim Off dřív, než tato automatizace zareaguje.
+  - id: ev_tpl_commit_soc
+    alias: EV commit SOC on interrupt
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: switch.ZASUVKA
+        to: "off"
+        for: { seconds: 8 }
+    conditions:
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.ev_mode
+            state: "Off"
+      - condition: state
+        entity_id: input_boolean.ev_finish_to_100
+        state: "off"
+      - condition: numeric_state
+        entity_id: sensor.ev_session_delivered_kwh
+        above: 0.1
+    actions:
+      - variables:
+          committed: >-
+            {% set cfg = 'sensor.ev_config' %}
+            {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+            {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.92) %}
+            {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+            {% set start = states('input_number.ev_soc_current') | float(0) %}
+            {% set pct = batt / 100 %}
+            {% set ns = namespace(added=0, rem=states('sensor.ev_session_delivered_kwh') | float(0)) %}
+            {% if start < 80 %}
+              {% set cap = (80 - start) * pct / eff_lo %}
+              {% if ns.rem <= cap %}
+                {% set ns.added = ns.rem * eff_lo / pct %}{% set ns.rem = 0 %}
+              {% else %}
+                {% set ns.added = 80 - start %}{% set ns.rem = ns.rem - cap %}
+              {% endif %}
+            {% endif %}
+            {% if ns.rem > 0 %}{% set ns.added = ns.added + ns.rem * eff_hi / pct %}{% endif %}
+            {{ [start + ns.added, 100] | min | round(0) }}
+      - action: input_number.set_value
+        target: { entity_id: input_number.ev_soc_current }
+        data: { value: "{{ committed }}" }
+      - action: input_select.select_option
+        target: { entity_id: input_select.ev_mode }
+        data: { option: "Off" }
+      - action: notify.MUJ_TELEFON
+        data:
+          title: "🔌 Nabíjení ukončeno"
+          message: "Uložen reálný stav {{ committed }} % (dodáno {{ states('sensor.ev_session_delivered_kwh') }} kWh)."

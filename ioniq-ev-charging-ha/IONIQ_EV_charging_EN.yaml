@@ -1,0 +1,729 @@
+# =============================================================================
+#  SMART CHARGING — Hyundai Ioniq Electric (28 kWh)  —  Home Assistant TEMPLATE
+# =============================================================================
+#
+#  What it does:
+#   - Calculates how much energy/time is needed from current to target SOC
+#   - "Quick Charge" = charge now to 80 %
+#   - "Charge to 100 % by departure" = 80 % now, remaining to 100 % timed for departure
+#   - "Manual" = dumb on/off, HA does not interfere, only shows the smart numbers (+ ETA to 100 %)
+#   - Watches the target and switches the plug off itself (incl. 15-min calibration at 100 %)
+#   - On a manual interrupt it saves the real reached SOC (does not fall back to start)
+#   - Tracks cost, monthly/yearly consumption, estimated range in km
+#   - Voice announcements (TTS) and phone notifications
+#
+# -----------------------------------------------------------------------------
+#  CHANGELOG
+# -----------------------------------------------------------------------------
+#  v1.2 (2026-07-05)
+#   - Fix: the session baseline is captured when the plug turns ON (not on power > 50 W).
+#     Previously a short pause mid-charge reset the counter -> overcharge.
+#   - Tuned by measurement: efficiency below 80 % = 0.95 (5 % loss), charger power = 2.12 kW.
+#  v1.1 (2026-06)
+#   - Added Manual mode (dumb on/off) + ETA-to-100 % sensor.
+#   - Added automatic save of the real SOC on a manual charge interrupt.
+#   - "EV stop on target" now ignores Manual mode.
+#  v1.0 (2026-05)
+#   - Base: Quick Charge (80 %), two-phase charge to 100 % by departure,
+#     SOC/cost/range calculation, monthly/yearly consumption, failsafe.
+#
+# -----------------------------------------------------------------------------
+#  HOW TO USE (3 steps — see IONIQ_EV_charging_guide_EN.md for the full walkthrough):
+# -----------------------------------------------------------------------------
+#  1) In your editor, "Find & Replace" these tokens:
+#
+#       switch.PLUG            ->  your smart plug (on/off),      e.g. switch.charger
+#       sensor.PLUG_power      ->  instantaneous power sensor (W), e.g. sensor.charger_power
+#       notify.MY_PHONE        ->  your phone notify service,      e.g. notify.mobile_app_pixel
+#       media_player.MY_SPEAKER->  (optional) speaker for TTS
+#       tts.MY_TTS             ->  (optional) TTS service, e.g. tts.google_translate_en
+#
+#     (No speaker/TTS? Just delete every block starting with "- action: tts.speak".)
+#
+#  2) You DON'T need to change the car constants (they are for the Ioniq 28 kWh).
+#     If your charging power differs, edit them below in "sensor: EV config".
+#
+#  3) Save the file to /config/packages/ and enable packages in configuration.yaml:
+#         homeassistant:
+#           packages: !include_dir_named packages
+#     Then restart Home Assistant.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1) HELPERS (user inputs)
+# -----------------------------------------------------------------------------
+input_number:
+  ev_soc_current:
+    name: EV SOC current
+    min: 0
+    max: 100
+    step: 1
+    mode: slider
+    unit_of_measurement: '%'
+    icon: mdi:battery-50
+
+  ev_soc_target:
+    name: EV SOC target
+    min: 50
+    max: 100
+    step: 5
+    initial: 80
+    mode: slider
+    unit_of_measurement: '%'
+    icon: mdi:battery-charging-100
+
+  ev_price:
+    name: EV price per kWh
+    min: 0
+    max: 30
+    step: 0.01
+    initial: 0.30          # <<< set your electricity price per kWh in the UI
+    mode: box
+    unit_of_measurement: '$'
+    icon: mdi:cash
+
+input_datetime:
+  ev_ready_time:
+    name: EV ready by (departure)
+    has_date: false
+    has_time: true
+
+input_select:
+  ev_mode:
+    name: EV mode
+    options:
+      - 'Off'
+      - 'Charge now'
+      - 'Scheduled'
+      - 'Manual'
+    initial: 'Off'
+    icon: mdi:ev-station
+
+input_button:
+  ev_reset_session:
+    name: EV reset session
+    icon: mdi:restart
+
+input_boolean:
+  ev_finish_to_100:
+    name: EV finish to 100
+    icon: mdi:battery-charging-100
+
+
+# -----------------------------------------------------------------------------
+# 2) POWER INTEGRATION -> cumulative consumption (kWh) from power (W)
+#    Needs ONLY the power sensor. HA derives the energy itself.
+# -----------------------------------------------------------------------------
+sensor:
+  - platform: integration
+    source: sensor.PLUG_power
+    name: ev_energy_session
+    unique_id: ev_energy_session
+    unit_prefix: k
+    method: trapezoidal
+    round: 3
+
+
+# -----------------------------------------------------------------------------
+# 3) MONTHLY / YEARLY METERING
+# -----------------------------------------------------------------------------
+utility_meter:
+  ev_monthly_energy:
+    source: sensor.ev_energy_session
+    cycle: monthly
+    name: EV monthly kWh
+  ev_yearly_energy:
+    source: sensor.ev_energy_session
+    cycle: yearly
+    name: EV yearly kWh
+
+
+# -----------------------------------------------------------------------------
+# 4) CALCULATION LOGIC
+# -----------------------------------------------------------------------------
+template:
+  # ===== CAR CONFIG (the only place with constants) =====
+  - sensor:
+      - name: "EV config"
+        unique_id: ev_config
+        state: "OK"
+        icon: mdi:cog
+        attributes:
+          battery_kwh: "28"        # battery capacity (kWh)
+          charger_kw: "2.12"       # charging power (kW) – measured at the plug (avg ~2121 W)
+          eff_below_80: "0.95"     # efficiency below 80 % (5 % loss) – tuned by measurement
+          eff_above_80: "0.80"     # efficiency 80–100 % (20 % loss)
+          range_km_at_100: "215"   # range at 100 % (km)
+          calibration_min: "15"    # BMS calibration at 100 % (min)
+
+  # ===== Snapshot of the starting kWh (charge start / manual reset) =====
+  # NOTE: triggers when the plug turns ON, NOT on "power > 50 W". Otherwise a short
+  # pause mid-charge (car pauses for a few seconds) would reset the baseline and
+  # charge twice as much as needed.
+  - trigger:
+      - trigger: state
+        entity_id: switch.PLUG
+        to: "on"
+      - trigger: state
+        entity_id: input_button.ev_reset_session
+    sensor:
+      - name: "ev_session_start_kwh"
+        unique_id: ev_session_start_kwh
+        state: "{{ states('sensor.ev_energy_session') | float(0) }}"
+        unit_of_measurement: kWh
+
+  - sensor:
+      # ---- kWh to deliver (incl. losses) from current -> target ----
+      - name: "EV kWh needed"
+        unique_id: ev_kwh_needed
+        unit_of_measurement: "kWh"
+        icon: mdi:flash
+        state: >-
+          {% set cfg = 'sensor.ev_config' %}
+          {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
+          {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+          {% set x = states('input_number.ev_soc_current') | float(0) %}
+          {% set t = states('input_number.ev_soc_target') | float(80) %}
+          {% set pct = batt / 100 %}
+          {% set ns = namespace(kwh=0) %}
+          {% if x < 80 and t > x %}
+            {% set upper = [t, 80] | min %}
+            {% set ns.kwh = ns.kwh + (upper - x) * pct / eff_lo %}
+          {% endif %}
+          {% if t > 80 %}
+            {% set lower = [x, 80] | max %}
+            {% set ns.kwh = ns.kwh + (t - lower) * pct / eff_hi %}
+          {% endif %}
+          {{ ns.kwh | round(2) }}
+
+      # ---- Charging duration in minutes ----
+      - name: "EV duration min"
+        unique_id: ev_duration_min
+        unit_of_measurement: "min"
+        icon: mdi:clock-outline
+        state: >-
+          {% set cfg = 'sensor.ev_config' %}
+          {% set kw = state_attr(cfg,'charger_kw') | float(2.12) %}
+          {% set calib = state_attr(cfg,'calibration_min') | float(15) %}
+          {% set kwh = states('sensor.ev_kwh_needed') | float(0) %}
+          {% set t = states('input_number.ev_soc_target') | float(80) %}
+          {% set m = kwh / kw * 60 %}
+          {% if t >= 100 %}{% set m = m + calib %}{% endif %}
+          {{ m | round(0) }}
+
+      # ---- Duration as text "Xh Ymin" ----
+      - name: "EV duration text"
+        unique_id: ev_duration_text
+        icon: mdi:clock-outline
+        state: >-
+          {% set m = states('sensor.ev_duration_min') | float(0) | round(0) | int %}
+          {% set h = m // 60 %}{% set rem = m % 60 %}
+          {% if h > 0 %}{{ h }} h {{ rem }} min{% else %}{{ rem }} min{% endif %}
+
+      # ---- Planned start = departure - duration ----
+      - name: "EV planned start"
+        unique_id: ev_planned_start
+        icon: mdi:clock-start
+        state: >-
+          {% set ready = states('input_datetime.ev_ready_time') %}
+          {% set duration = states('sensor.ev_duration_min') | float(0) %}
+          {% if ready in ['unknown','unavailable','none'] or duration == 0 %}
+            unknown
+          {% else %}
+            {% set today_ready = today_at(ready) %}
+            {% if today_ready < now() %}{% set today_ready = today_ready + timedelta(days=1) %}{% endif %}
+            {{ (today_ready - timedelta(minutes=duration)).strftime('%H:%M') }}
+          {% endif %}
+
+      # ---- Energy delivered this session ----
+      - name: "EV session delivered kWh"
+        unique_id: ev_session_delivered_kwh
+        unit_of_measurement: "kWh"
+        icon: mdi:battery-plus
+        state: >-
+          {% set total = states('sensor.ev_energy_session') | float(0) %}
+          {% set start = states('sensor.ev_session_start_kwh') | float(0) %}
+          {{ [0, total - start] | max | round(3) }}
+
+      # ---- Estimated current SOC (adds delivered energy only while charging) ----
+      - name: "EV estimated SOC"
+        unique_id: ev_estimated_soc
+        unit_of_measurement: "%"
+        icon: mdi:battery-heart
+        state: >-
+          {% set cfg = 'sensor.ev_config' %}
+          {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
+          {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+          {% set start_soc = states('input_number.ev_soc_current') | float(0) %}
+          {% set pct = batt / 100 %}
+          {% set ns = namespace(added=0, remaining_kwh=0) %}
+          {% if is_state('binary_sensor.ev_charging','on') %}
+            {% set ns.remaining_kwh = states('sensor.ev_session_delivered_kwh') | float(0) %}
+            {% if start_soc < 80 %}
+              {% set cap_low = (80 - start_soc) * pct / eff_lo %}
+              {% if ns.remaining_kwh <= cap_low %}
+                {% set ns.added = ns.remaining_kwh * eff_lo / pct %}
+                {% set ns.remaining_kwh = 0 %}
+              {% else %}
+                {% set ns.added = 80 - start_soc %}
+                {% set ns.remaining_kwh = ns.remaining_kwh - cap_low %}
+              {% endif %}
+            {% endif %}
+            {% if ns.remaining_kwh > 0 %}
+              {% set ns.added = ns.added + ns.remaining_kwh * eff_hi / pct %}
+            {% endif %}
+          {% endif %}
+          {{ [start_soc + ns.added, 100] | min | round(1) }}
+
+      # ---- Remaining minutes ----
+      - name: "EV remaining min"
+        unique_id: ev_remaining_min
+        unit_of_measurement: "min"
+        icon: mdi:timer-sand
+        state: >-
+          {% set duration = states('sensor.ev_duration_min') | float(0) %}
+          {% set delivered = states('sensor.ev_session_delivered_kwh') | float(0) %}
+          {% set needed = states('sensor.ev_kwh_needed') | float(0) %}
+          {% if needed == 0 %}0{% else %}{{ [0, duration * (1 - delivered / needed)] | max | round(0) }}{% endif %}
+
+      # ---- Remaining time as text ----
+      - name: "EV remaining text"
+        unique_id: ev_remaining_text
+        icon: mdi:timer-sand
+        state: >-
+          {% set m = states('sensor.ev_remaining_min') | float(0) | round(0) | int %}
+          {% set h = m // 60 %}{% set rem = m % 60 %}
+          {% if h > 0 %}{{ h }} h {{ rem }} min{% else %}{{ rem }} min{% endif %}
+
+      # ---- ETA to target ----
+      - name: "EV ETA"
+        unique_id: ev_eta
+        icon: mdi:flag-checkered
+        state: >-
+          {% set remaining = states('sensor.ev_remaining_min') | float(0) %}
+          {% if is_state('binary_sensor.ev_charging','on') and remaining > 0 %}
+            {{ (now() + timedelta(minutes=remaining)).strftime('%H:%M') }}
+          {% else %}—{% endif %}
+
+      # ---- ETA to 100 % (uses ACTUAL power) – useful in Manual mode ----
+      - name: "EV ETA 100"
+        unique_id: ev_eta_100
+        icon: mdi:battery-charging-100
+        state: >-
+          {% set cfg = 'sensor.ev_config' %}
+          {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
+          {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+          {% set calib = state_attr(cfg,'calibration_min') | float(15) %}
+          {% set soc = states('sensor.ev_estimated_soc') | float(0) %}
+          {% set power_kw = states('sensor.PLUG_power') | float(0) / 1000 %}
+          {% if is_state('binary_sensor.ev_charging','on') and soc < 100 and power_kw > 0.2 %}
+            {% set pct = batt / 100 %}
+            {% set ns = namespace(kwh=0) %}
+            {% if soc < 80 %}{% set ns.kwh = ns.kwh + (80 - soc) * pct / eff_lo %}{% endif %}
+            {% set ns.kwh = ns.kwh + (100 - [soc, 80] | max) * pct / eff_hi %}
+            {% set mins = ns.kwh / power_kw * 60 + calib %}
+            {{ (now() + timedelta(minutes=mins)).strftime('%H:%M') }}
+          {% else %}—{% endif %}
+
+      # ---- Range in km ----
+      - name: "EV range km"
+        unique_id: ev_range_km
+        unit_of_measurement: "km"
+        icon: mdi:map-marker-distance
+        state: >-
+          {% set range = state_attr('sensor.ev_config','range_km_at_100') | float(215) %}
+          {% set soc = states('sensor.ev_estimated_soc') | float(0) %}
+          {{ (soc * range / 100) | round(0) }}
+
+      # ---- Current session cost ----
+      - name: "EV session cost"
+        unique_id: ev_session_cost
+        unit_of_measurement: "$"
+        icon: mdi:cash
+        state: >-
+          {% set kwh = states('sensor.ev_session_delivered_kwh') | float(0) %}
+          {% set price = states('input_number.ev_price') | float(0) %}
+          {{ (kwh * price) | round(2) }}
+
+      # ---- Monthly / yearly consumption (rounded) ----
+      - name: "EV monthly kWh display"
+        unique_id: ev_monthly_kwh_display
+        unit_of_measurement: "kWh"
+        icon: mdi:calendar-month
+        state: "{{ states('sensor.ev_monthly_kwh') | float(0) | round(2) }}"
+
+      - name: "EV yearly kWh display"
+        unique_id: ev_yearly_kwh_display
+        unit_of_measurement: "kWh"
+        icon: mdi:calendar
+        state: "{{ states('sensor.ev_yearly_kwh') | float(0) | round(2) }}"
+
+      # ---- Monthly / yearly cost ----
+      - name: "EV monthly cost"
+        unique_id: ev_monthly_cost
+        unit_of_measurement: "$"
+        icon: mdi:cash-multiple
+        state: >-
+          {{ (states('sensor.ev_monthly_kwh') | float(0) * states('input_number.ev_price') | float(0)) | round(2) }}
+
+      - name: "EV yearly cost"
+        unique_id: ev_yearly_cost
+        unit_of_measurement: "$"
+        icon: mdi:cash-multiple
+        state: >-
+          {{ (states('sensor.ev_yearly_kwh') | float(0) * states('input_number.ev_price') | float(0)) | round(2) }}
+
+  - binary_sensor:
+      # ---- Is charging active? (power > 100 W for over 30 s) ----
+      - name: "EV charging"
+        unique_id: ev_charging
+        device_class: power
+        icon: mdi:ev-station
+        state: "{{ states('sensor.PLUG_power') | float(0) > 100 }}"
+        delay_on:
+          seconds: 30
+        delay_off:
+          seconds: 30
+
+
+# -----------------------------------------------------------------------------
+# 5) SCRIPTS (dashboard buttons)
+# -----------------------------------------------------------------------------
+script:
+  ev_quick_charge:
+    alias: EV Quick Charge
+    icon: mdi:flash
+    mode: single
+    sequence:
+      - action: input_number.set_value
+        target: { entity_id: input_number.ev_soc_target }
+        data: { value: 80 }
+      - action: input_select.select_option
+        target: { entity_id: input_select.ev_mode }
+        data: { option: "Charge now" }
+
+  ev_charge_100_by_departure:
+    alias: EV charge 100 by departure
+    icon: mdi:calendar-clock
+    mode: single
+    sequence:
+      - choose:
+          - conditions:
+              - condition: numeric_state
+                entity_id: input_number.ev_soc_current
+                below: 80
+            sequence:
+              - action: input_boolean.turn_on
+                target: { entity_id: input_boolean.ev_finish_to_100 }
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_target }
+                data: { value: 80 }
+              - action: input_select.select_option
+                target: { entity_id: input_select.ev_mode }
+                data: { option: "Charge now" }
+        default:
+          - action: input_boolean.turn_off
+            target: { entity_id: input_boolean.ev_finish_to_100 }
+          - action: input_number.set_value
+            target: { entity_id: input_number.ev_soc_target }
+            data: { value: 100 }
+          - action: input_select.select_option
+            target: { entity_id: input_select.ev_mode }
+            data: { option: "Scheduled" }
+
+
+# -----------------------------------------------------------------------------
+# 6) AUTOMATIONS
+# -----------------------------------------------------------------------------
+automation:
+  # ===== Start now (Charge now) =====
+  - id: ev_tpl_start_now
+    alias: EV start now
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: input_select.ev_mode
+        to: "Charge now"
+    conditions:
+      - condition: state
+        entity_id: switch.PLUG
+        state: "off"
+    actions:
+      - choose:
+          - conditions:
+              - condition: numeric_state
+                entity_id: sensor.ev_kwh_needed
+                above: 0
+            sequence:
+              - action: switch.turn_on
+                target: { entity_id: switch.PLUG }
+              - action: notify.MY_PHONE
+                data:
+                  title: "⚡ Charging started"
+                  message: "Target {{ states('input_number.ev_soc_target') }} %, est. {{ states('sensor.ev_duration_min') }} min"
+              # optional TTS:
+              - action: tts.speak
+                target: { entity_id: tts.MY_TTS }
+                data:
+                  cache: true
+                  media_player_entity_id: media_player.MY_SPEAKER
+                  language: en
+                  message: "Charging started. Estimated {{ states('sensor.ev_duration_min') }} minutes."
+        default:
+          - action: notify.MY_PHONE
+            data:
+              title: "Nothing to charge"
+              message: "Current SOC ({{ states('input_number.ev_soc_current') }} %) already reaches the target ({{ states('input_number.ev_soc_target') }} %)."
+          - action: input_select.select_option
+            target: { entity_id: input_select.ev_mode }
+            data: { option: "Off" }
+
+  # ===== Scheduled start =====
+  - id: ev_tpl_start_scheduled
+    alias: EV start scheduled
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: "/1"
+    conditions:
+      - condition: state
+        entity_id: input_select.ev_mode
+        state: "Scheduled"
+      - condition: state
+        entity_id: switch.PLUG
+        state: "off"
+      - condition: numeric_state
+        entity_id: sensor.ev_kwh_needed
+        above: 0
+      - condition: template
+        value_template: "{{ now().strftime('%H:%M') == states('sensor.ev_planned_start') }}"
+    actions:
+      - action: switch.turn_on
+        target: { entity_id: switch.PLUG }
+      - action: notify.MY_PHONE
+        data:
+          title: "⚡ Charging started (scheduled)"
+          message: "Target {{ states('input_number.ev_soc_target') }} %, ready by {{ states('input_datetime.ev_ready_time')[:5] }}"
+      - action: tts.speak
+        target: { entity_id: tts.MY_TTS }
+        data:
+          cache: true
+          media_player_entity_id: media_player.MY_SPEAKER
+          language: en
+          message: "Charging started, ready by {{ states('input_datetime.ev_ready_time')[:5] }}."
+
+  # ===== Stop on target (+ two-phase 80->100 transition). Ignores Manual. =====
+  - id: ev_tpl_stop_on_target
+    alias: EV stop on target
+    mode: single
+    triggers:
+      - trigger: template
+        value_template: >-
+          {{ (states('sensor.ev_session_delivered_kwh') | float(0)) >= (states('sensor.ev_kwh_needed') | float(99999))
+             and (states('sensor.ev_kwh_needed') | float(0)) > 0 }}
+      - trigger: template
+        value_template: >-
+          {{ is_state('switch.PLUG','on')
+             and (is_state('input_select.ev_mode','Charge now') or is_state('input_select.ev_mode','Scheduled'))
+             and (states('sensor.ev_kwh_needed') | float(1)) <= 0 }}
+    conditions:
+      - condition: state
+        entity_id: switch.PLUG
+        state: "on"
+      # Manual mode is IGNORED (auto-stop does not apply)
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: input_select.ev_mode
+            state: "Charge now"
+          - condition: state
+            entity_id: input_select.ev_mode
+            state: "Scheduled"
+    actions:
+      # 15-min calibration only when target is 100 %
+      - choose:
+          - conditions:
+              - condition: numeric_state
+                entity_id: input_number.ev_soc_target
+                above: 99
+            sequence:
+              - action: notify.MY_PHONE
+                data:
+                  title: "⏳ Calibration 15 min"
+                  message: "Reached {{ states('sensor.ev_session_delivered_kwh') }} kWh, calibrating until {{ (now() + timedelta(minutes=15)).strftime('%H:%M') }}"
+              - delay: { minutes: 15 }
+      - action: switch.turn_off
+        target: { entity_id: switch.PLUG }
+      # phase 1 (80) -> phase 2 (100 by departure), or normal completion
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: input_boolean.ev_finish_to_100
+                state: "on"
+              - condition: numeric_state
+                entity_id: input_number.ev_soc_target
+                below: 100
+            sequence:
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_current }
+                data: { value: 80 }
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_target }
+                data: { value: 100 }
+              - action: input_select.select_option
+                target: { entity_id: input_select.ev_mode }
+                data: { option: "Scheduled" }
+              - action: notify.MY_PHONE
+                data:
+                  title: "🔋 Phase 1 done (80 %)"
+                  message: "Top-up to 100 % scheduled for {{ states('input_datetime.ev_ready_time')[:5] }} (start ~{{ states('sensor.ev_planned_start') }})."
+        default:
+          - action: input_select.select_option
+            target: { entity_id: input_select.ev_mode }
+            data: { option: "Off" }
+          - action: input_number.set_value
+            target: { entity_id: input_number.ev_soc_current }
+            data: { value: "{{ states('input_number.ev_soc_target') | float(80) }}" }
+          - action: input_boolean.turn_off
+            target: { entity_id: input_boolean.ev_finish_to_100 }
+
+  # ===== Milestone alerts at 80 % and 100 % =====
+  - id: ev_tpl_warn_milestones
+    alias: EV warn milestones
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.ev_estimated_soc
+        above: 80
+        id: "80"
+      - trigger: numeric_state
+        entity_id: sensor.ev_estimated_soc
+        above: 99.9
+        id: "100"
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.ev_charging
+        state: "on"
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: "80"
+            sequence:
+              - action: notify.MY_PHONE
+                data:
+                  title: "🔋 80 %"
+                  message: "Charged to 80 %. Delivered {{ states('sensor.ev_session_delivered_kwh') }} kWh for {{ states('sensor.ev_session_cost') }}."
+          - conditions:
+              - condition: trigger
+                id: "100"
+            sequence:
+              - action: notify.MY_PHONE
+                data:
+                  title: "🔋 100 %"
+                  message: "Fully charged. Delivered {{ states('sensor.ev_session_delivered_kwh') }} kWh for {{ states('sensor.ev_session_cost') }}."
+
+  # ===== Failsafe: plug is charging but mode is Off (typically after HA restart) =====
+  - id: ev_tpl_failsafe
+    alias: EV failsafe
+    mode: single
+    triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/10"
+    conditions:
+      - condition: state
+        entity_id: switch.PLUG
+        state: "on"
+      - condition: state
+        entity_id: input_select.ev_mode
+        state: "Off"
+      - condition: numeric_state
+        entity_id: sensor.PLUG_power
+        above: 50
+    actions:
+      - action: input_select.select_option
+        target: { entity_id: input_select.ev_mode }
+        data: { option: "Charge now" }
+      - action: notify.MY_PHONE
+        data:
+          title: "EV failsafe"
+          message: "Detected charging without an active mode. Switching to Charge now."
+
+  # ===== Manual mode: dumb plug-on, HA does not interfere =====
+  - id: ev_tpl_manual_start
+    alias: EV manual start
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: input_select.ev_mode
+        to: "Manual"
+    conditions: []
+    actions:
+      - action: switch.turn_on
+        target: { entity_id: switch.PLUG }
+      - action: notify.MY_PHONE
+        data:
+          title: "🔧 Manual charging"
+          message: "Plug forced on. Turn it off manually and the real SOC will be saved. HA won't interfere."
+
+  # ===== Save the real SOC on a manual interrupt =====
+  # When the plug turns off mid-charge (mode != Off, not two-phase), writes the real
+  # reached SOC into ev_soc_current instead of falling back to the start. Also covers
+  # turning Manual off. A normal completion (stop on target) is skipped because the
+  # mode is already Off before this reacts.
+  - id: ev_tpl_commit_soc
+    alias: EV commit SOC on interrupt
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: switch.PLUG
+        to: "off"
+        for: { seconds: 8 }
+    conditions:
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.ev_mode
+            state: "Off"
+      - condition: state
+        entity_id: input_boolean.ev_finish_to_100
+        state: "off"
+      - condition: numeric_state
+        entity_id: sensor.ev_session_delivered_kwh
+        above: 0.1
+    actions:
+      - variables:
+          committed: >-
+            {% set cfg = 'sensor.ev_config' %}
+            {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+            {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
+            {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+            {% set start = states('input_number.ev_soc_current') | float(0) %}
+            {% set pct = batt / 100 %}
+            {% set ns = namespace(added=0, rem=states('sensor.ev_session_delivered_kwh') | float(0)) %}
+            {% if start < 80 %}
+              {% set cap = (80 - start) * pct / eff_lo %}
+              {% if ns.rem <= cap %}
+                {% set ns.added = ns.rem * eff_lo / pct %}{% set ns.rem = 0 %}
+              {% else %}
+                {% set ns.added = 80 - start %}{% set ns.rem = ns.rem - cap %}
+              {% endif %}
+            {% endif %}
+            {% if ns.rem > 0 %}{% set ns.added = ns.added + ns.rem * eff_hi / pct %}{% endif %}
+            {{ [start + ns.added, 100] | min | round(0) }}
+      - action: input_number.set_value
+        target: { entity_id: input_number.ev_soc_current }
+        data: { value: "{{ committed }}" }
+      - action: input_select.select_option
+        target: { entity_id: input_select.ev_mode }
+        data: { option: "Off" }
+      - action: notify.MY_PHONE
+        data:
+          title: "🔌 Charging ended"
+          message: "Saved real SOC {{ committed }} % (delivered {{ states('sensor.ev_session_delivered_kwh') }} kWh)."
