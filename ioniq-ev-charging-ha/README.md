@@ -1,8 +1,16 @@
 # 🔌 IONIQ EV Charging for Home Assistant
 
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+![Home Assistant](https://img.shields.io/badge/Home%20Assistant-package-41BDF5.svg)
+![HACS: not required](https://img.shields.io/badge/HACS-not%20required-orange.svg)
+
 Smart charging package for the **Hyundai Ioniq Electric (28 kWh)** that turns an ordinary
 metering smart plug into an intelligent charger — target-aware auto stop, battery-friendly
 timed 100 % charging, live SOC / range / cost estimates, and voice + phone notifications.
+
+<p align="center">
+  <img src="dashboard-preview.svg" alt="EV charging dashboard preview" width="380">
+</p>
 
 > 🇬🇧 English guide → **[IONIQ_EV_charging_guide_EN.md](IONIQ_EV_charging_guide_EN.md)**
 > 🇨🇿 Český návod → **[IONIQ_EV_charging_guide_CZ.md](IONIQ_EV_charging_guide_CZ.md)**
@@ -96,4 +104,5 @@ efficiency after a couple of charges (see "Fine-tuning" in the guide).
 
 ## 📄 License
 
-Free to use and modify. Made for the Hyundai Ioniq Electric 28 kWh community.
+Released under the [MIT License](LICENSE) — free to use and modify.
+Made for the Hyundai Ioniq Electric 28 kWh community.
