@@ -68,7 +68,6 @@ input_number:
     min: 50
     max: 100
     step: 5
-    initial: 80
     mode: slider
     unit_of_measurement: '%'
     icon: mdi:battery-charging-100
@@ -77,8 +76,7 @@ input_number:
     name: EV price per kWh
     min: 0
     max: 30
-    step: 0.01
-    initial: 0.30          # <<< set your electricity price per kWh in the UI
+    step: 0.01           # set your price once in the UI — without 'initial:' it survives a restart
     mode: box
     unit_of_measurement: '$'
     icon: mdi:cash
@@ -97,7 +95,7 @@ input_select:
       - 'Charge now'
       - 'Scheduled'
       - 'Manual'
-    initial: 'Off'
+    # No 'initial:' — mode (and target) survive an HA restart so scheduled charging resumes.
     icon: mdi:ev-station
 
 input_button:

@@ -92,6 +92,11 @@ efficiency after a couple of charges (see "Fine-tuning" in the guide).
 
 ## 📝 Changelog
 
+- **v1.3 (2026-07-07)** — Fix: removed `initial:` from `ev_mode`, `ev_soc_target` and the price
+  helper so mode, target and price **survive an HA restart**. Previously a restart mid-charge reset
+  the mode to `Off` and the target to 80 %, silently cancelling a scheduled 100 %-by-departure
+  charge (and the price reverted to the shipped default). The failsafe automation now also requires
+  `ev_kwh_needed > 0`, so it can no longer trigger a spurious stop right after startup.
 - **v1.2 (2026-07-05)** — Fix: session baseline captured on plug-ON (not power > 50 W); a short
   mid-charge pause no longer resets the counter (previously caused overcharge).
   Measured tuning: efficiency < 80 % = 0.95, charger power = 2.12 kW.

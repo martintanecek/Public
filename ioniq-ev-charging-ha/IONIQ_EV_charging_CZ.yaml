@@ -68,7 +68,6 @@ input_number:
     min: 50
     max: 100
     step: 5
-    initial: 80
     mode: slider
     unit_of_measurement: '%'
     icon: mdi:battery-charging-100
@@ -77,8 +76,7 @@ input_number:
     name: EV cena za kWh
     min: 0
     max: 30
-    step: 0.01
-    initial: 6.0          # <<< nastav si svou cenu elektřiny (Kč/kWh) v UI
+    step: 0.01           # cenu nastav jednou v UI — bez 'initial:' zůstane přes restart
     mode: box
     unit_of_measurement: 'Kč'
     icon: mdi:cash
@@ -97,7 +95,7 @@ input_select:
       - 'Charge now'
       - 'Scheduled'
       - 'Manual'
-    initial: 'Off'
+    # Bez 'initial:' — režim (a cíl) přežije restart HA a scheduled nabíjení pokračuje.
     icon: mdi:ev-station
 
 input_button:
