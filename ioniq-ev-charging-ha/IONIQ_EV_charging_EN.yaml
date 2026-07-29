@@ -15,6 +15,20 @@
 # -----------------------------------------------------------------------------
 #  CHANGELOG
 # -----------------------------------------------------------------------------
+#  v1.4 (2026-07-29)
+#   - "Off" now physically stops charging (new ev_tpl_off_stop). Before it only
+#     disarmed the auto-stop and the failsafe re-armed the plug within 10 min.
+#   - New no-draw watchdog (ev_tpl_no_draw): 20 min below 50 W closes the session.
+#     Two triggers on purpose - numeric_state only fires when the value CROSSES the
+#     threshold, so a plug reporting a flat zero (car never plugged in) never fired it.
+#   - Scheduled start uses a WINDOW planned_start..ready + homeassistant.start trigger
+#     instead of one exact minute, so a missed start is caught up.
+#   - ev_tpl_commit_soc: requires previous state "on" (ignores unavailable->off blips)
+#     and always falls back to mode Off (the old delivered>0.1 condition could leave
+#     the mode at Scheduled and the plug was switched back on every minute).
+#  v1.3 (2026-07-07)
+#   - Fix: removed 'initial:' from ev_mode / ev_soc_target / price helper so they
+#     survive an HA restart. The failsafe now also requires ev_kwh_needed > 0.
 #  v1.2 (2026-07-05)
 #   - Fix: the session baseline is captured when the plug turns ON (not on power > 50 W).
 #     Previously a short pause mid-charge reset the counter -> overcharge.
@@ -487,6 +501,9 @@ automation:
     triggers:
       - trigger: time_pattern
         minutes: "/1"
+      # v1.4: also catch up after an HA outage / restart
+      - trigger: homeassistant
+        event: start
     conditions:
       - condition: state
         entity_id: input_select.ev_mode
@@ -497,15 +514,30 @@ automation:
       - condition: numeric_state
         entity_id: sensor.ev_kwh_needed
         above: 0
+      # v1.4: WINDOW planned_start .. ready instead of an exact minute match.
+      # Previously HA only had to be down for that single minute (or planned_start
+      # landed in the past because there was little time until ready) and the
+      # charge simply never started that night.
       - condition: template
-        value_template: "{{ now().strftime('%H:%M') == states('sensor.ev_planned_start') }}"
+        alias: "Inside the planned_start .. ready window (catches up a missed start)"
+        value_template: >-
+          {% set ready = states('input_datetime.ev_ready_time') %}
+          {% set duration = states('sensor.ev_duration_min') | float(0) %}
+          {% if ready in ['unknown','unavailable','none'] or duration == 0 %}
+            false
+          {% else %}
+            {% set tr = today_at(ready[:5]) %}
+            {% if tr < now() %}{% set tr = tr + timedelta(days=1) %}{% endif %}
+            {% set st = tr - timedelta(minutes=duration) %}
+            {{ now() >= st and now() < tr }}
+          {% endif %}
     actions:
       - action: switch.turn_on
         target: { entity_id: switch.PLUG }
       - action: notify.MY_PHONE
         data:
           title: "⚡ Charging started (scheduled)"
-          message: "Target {{ states('input_number.ev_soc_target') }} %, ready by {{ states('input_datetime.ev_ready_time')[:5] }}"
+          message: "Target {{ states('input_number.ev_soc_target') }} %, ready by {{ states('input_datetime.ev_ready_time')[:5] }} (est. {{ states('sensor.ev_duration_min') }} min)"
       - action: tts.speak
         target: { entity_id: tts.MY_TTS }
         data:
@@ -692,11 +724,13 @@ automation:
       - condition: state
         entity_id: input_boolean.ev_finish_to_100
         state: "off"
-      - condition: numeric_state
-        entity_id: sensor.ev_session_delivered_kwh
-        above: 0.1
+      # v1.4: ignore a plug dropout (unavailable -> off), only react to a real switch-off
+      - condition: template
+        alias: "Only when the plug's previous state was on"
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state == 'on' }}"
     actions:
       - variables:
+          delivered: "{{ states('sensor.ev_session_delivered_kwh') | float(0) }}"
           committed: >-
             {% set cfg = 'sensor.ev_config' %}
             {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
@@ -715,13 +749,153 @@ automation:
             {% endif %}
             {% if ns.rem > 0 %}{% set ns.added = ns.added + ns.rem * eff_hi / pct %}{% endif %}
             {{ [start + ns.added, 100] | min | round(0) }}
-      - action: input_number.set_value
-        target: { entity_id: input_number.ev_soc_current }
-        data: { value: "{{ committed }}" }
+      # v1.4: commit only when there is something to save, BUT always fall back to Off.
+      # Previously the `delivered > 0.1` condition blocked the whole automation, the mode
+      # stayed Scheduled and "EV start scheduled" switched the plug back on every minute.
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ delivered > 0.1 }}"
+            sequence:
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_current }
+                data: { value: "{{ committed }}" }
       - action: input_select.select_option
         target: { entity_id: input_select.ev_mode }
         data: { option: "Off" }
       - action: notify.MY_PHONE
         data:
           title: "🔌 Charging ended"
-          message: "Saved real SOC {{ committed }} % (delivered {{ states('sensor.ev_session_delivered_kwh') }} kWh)."
+          message: >-
+            {{ ('Saved real SOC ' ~ committed ~ ' % (delivered ' ~ (delivered | round(2)) ~ ' kWh).')
+               if delivered > 0.1 else 'Charging interrupted at the very start, SOC unchanged.' }}
+
+  # ===== Off = physically stop charging (v1.4) =====
+  # Without this, "Off" only disarmed the auto-stop — the plug stayed energised
+  # and the failsafe re-armed it as an active charge within 10 minutes.
+  - id: ev_tpl_off_stop
+    alias: EV Off = stop charging
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: input_select.ev_mode
+        to: "Off"
+    conditions:
+      # only while the plug is on — never touches another appliance on the same plug
+      - condition: state
+        entity_id: switch.PLUG
+        state: "on"
+    actions:
+      - variables:
+          delivered: "{{ states('sensor.ev_session_delivered_kwh') | float(0) }}"
+          committed: >-
+            {% set cfg = 'sensor.ev_config' %}
+            {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+            {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
+            {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+            {% set start = states('input_number.ev_soc_current') | float(0) %}
+            {% set pct = batt / 100 %}
+            {% set ns = namespace(added=0, rem=states('sensor.ev_session_delivered_kwh') | float(0)) %}
+            {% if start < 80 %}
+              {% set cap = (80 - start) * pct / eff_lo %}
+              {% if ns.rem <= cap %}
+                {% set ns.added = ns.rem * eff_lo / pct %}{% set ns.rem = 0 %}
+              {% else %}
+                {% set ns.added = 80 - start %}{% set ns.rem = ns.rem - cap %}
+              {% endif %}
+            {% endif %}
+            {% if ns.rem > 0 %}{% set ns.added = ns.added + ns.rem * eff_hi / pct %}{% endif %}
+            {{ [start + ns.added, 100] | min | round(0) }}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ delivered > 0.1 }}"
+            sequence:
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_current }
+                data: { value: "{{ committed }}" }
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.ev_finish_to_100 }
+      # order matters: switch the plug off while the mode is already Off, so
+      # ev_tpl_commit_soc cannot fire and commit a second time
+      - action: switch.turn_off
+        target: { entity_id: switch.PLUG }
+      - action: notify.MY_PHONE
+        data:
+          title: "🔌 Charging stopped"
+          message: >-
+            {{ ('Saved real SOC ' ~ committed ~ ' % (' ~ (delivered | round(2)) ~ ' kWh).')
+               if delivered > 0.1 else 'Plug switched off.' }}
+
+  # ===== No draw = car finished on its own / never plugged in (v1.4) =====
+  # Fixes "the plug stays energised forever" when the car stops drawing before the
+  # model reaches its target. 20 min is safely past the 15-min calibration at 100 %.
+  - id: ev_tpl_no_draw
+    alias: EV no-draw auto stop
+    mode: single
+    triggers:
+      # a) power dropped below the threshold (car finished / unplugged mid-charge)
+      - trigger: numeric_state
+        entity_id: sensor.PLUG_power
+        below: 50
+        for: { minutes: 20 }
+      # b) plug has been on for 20 min — catches the case where power was a flat zero
+      #    from the start (car never plugged in) so numeric_state never crossed
+      - trigger: state
+        entity_id: switch.PLUG
+        to: "on"
+        for: { minutes: 20 }
+    conditions:
+      - condition: state
+        entity_id: switch.PLUG
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.ev_mode
+            state: "Off"
+      - condition: numeric_state
+        entity_id: sensor.PLUG_power
+        below: 50
+    actions:
+      - variables:
+          delivered: "{{ states('sensor.ev_session_delivered_kwh') | float(0) }}"
+          committed: >-
+            {% set cfg = 'sensor.ev_config' %}
+            {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+            {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
+            {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+            {% set start = states('input_number.ev_soc_current') | float(0) %}
+            {% set pct = batt / 100 %}
+            {% set ns = namespace(added=0, rem=states('sensor.ev_session_delivered_kwh') | float(0)) %}
+            {% if start < 80 %}
+              {% set cap = (80 - start) * pct / eff_lo %}
+              {% if ns.rem <= cap %}
+                {% set ns.added = ns.rem * eff_lo / pct %}{% set ns.rem = 0 %}
+              {% else %}
+                {% set ns.added = 80 - start %}{% set ns.rem = ns.rem - cap %}
+              {% endif %}
+            {% endif %}
+            {% if ns.rem > 0 %}{% set ns.added = ns.added + ns.rem * eff_hi / pct %}{% endif %}
+            {{ [start + ns.added, 100] | min | round(0) }}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ delivered > 0.1 }}"
+            sequence:
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_current }
+                data: { value: "{{ committed }}" }
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.ev_finish_to_100 }
+      - action: switch.turn_off
+        target: { entity_id: switch.PLUG }
+      - action: input_select.select_option
+        target: { entity_id: input_select.ev_mode }
+        data: { option: "Off" }
+      - action: notify.MY_PHONE
+        data:
+          title: "🔌 Charging ended"
+          message: >-
+            {{ ('Car finished or unplugged — 20 min with no draw. Saved real SOC ' ~ committed ~ ' % (' ~ (delivered | round(2)) ~ ' kWh).')
+               if delivered > 0.1 else 'No draw for 20 min — the car is probably not plugged in. Switching off.' }}

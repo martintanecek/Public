@@ -15,6 +15,20 @@
 # -----------------------------------------------------------------------------
 #  CHANGELOG
 # -----------------------------------------------------------------------------
+#  v1.4 (2026-07-29)
+#   - "Off" nyní nabíjení fyzicky zastaví (nová ev_tpl_off_stop). Dřív jen odzbrojil
+#     auto-stop a failsafe zásuvku do 10 minut zase přihlásil jako aktivní nabíjení.
+#   - Nový hlídač bez odběru (ev_tpl_no_draw): 20 min pod 50 W uzavře session.
+#     Dva triggery záměrně - numeric_state vystřelí jen při PŘEKROČENÍ prahu, takže
+#     zásuvka hlásící plochou nulu (auto vůbec nepřipojené) ho nikdy nespustila.
+#   - Naplánovaný start používá OKNO planned_start..ready + trigger homeassistant.start
+#     místo shody na jedinou minutu, takže se zmeškaný start dožene.
+#   - ev_tpl_commit_soc: vyžaduje předchozí stav "on" (ignoruje výpadky unavailable->off)
+#     a režim Off nastaví vždy (stará podmínka delivered>0.1 mohla nechat režim na
+#     Scheduled a okenní start pak zásuvku každou minutu znovu zapínal).
+#  v1.3 (2026-07-07)
+#   - Oprava: odstraněno 'initial:' z ev_mode / ev_soc_target / ceny, aby přežily
+#     restart HA. Failsafe nově vyžaduje ev_kwh_needed > 0.
 #  v1.2 (2026-07-05)
 #   - Oprava: baseline session se nastaví při ZAPNUTÍ zásuvky (ne při výkonu >50 W).
 #     Dřív krátká pauza odběru uprostřed nabíjení vynulovala počítadlo -> přebití.
@@ -180,7 +194,7 @@ template:
         state: >-
           {% set cfg = 'sensor.ev_config' %}
           {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
-          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.92) %}
+          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
           {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
           {% set x = states('input_number.ev_soc_current') | float(0) %}
           {% set t = states('input_number.ev_soc_target') | float(80) %}
@@ -253,7 +267,7 @@ template:
         state: >-
           {% set cfg = 'sensor.ev_config' %}
           {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
-          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.92) %}
+          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
           {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
           {% set start_soc = states('input_number.ev_soc_current') | float(0) %}
           {% set pct = batt / 100 %}
@@ -313,7 +327,7 @@ template:
         state: >-
           {% set cfg = 'sensor.ev_config' %}
           {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
-          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.92) %}
+          {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
           {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
           {% set calib = state_attr(cfg,'calibration_min') | float(15) %}
           {% set soc = states('sensor.ev_estimated_soc') | float(0) %}
@@ -487,6 +501,9 @@ automation:
     triggers:
       - trigger: time_pattern
         minutes: "/1"
+      # v1.4: dožene start i po výpadku / restartu HA
+      - trigger: homeassistant
+        event: start
     conditions:
       - condition: state
         entity_id: input_select.ev_mode
@@ -497,15 +514,29 @@ automation:
       - condition: numeric_state
         entity_id: sensor.ev_kwh_needed
         above: 0
+      # v1.4: OKNO planned_start .. ready místo přesné shody na minutu.
+      # Dřív stačilo, aby HA byl tu jedinou minutu dole (nebo aby planned_start
+      # vyšel do minulosti kvůli málu času do ready), a start se ten den nekonal.
       - condition: template
-        value_template: "{{ now().strftime('%H:%M') == states('sensor.ev_planned_start') }}"
+        alias: "V okně planned_start .. ready (dožene i zmeškaný start)"
+        value_template: >-
+          {% set ready = states('input_datetime.ev_ready_time') %}
+          {% set duration = states('sensor.ev_duration_min') | float(0) %}
+          {% if ready in ['unknown','unavailable','none'] or duration == 0 %}
+            false
+          {% else %}
+            {% set tr = today_at(ready[:5]) %}
+            {% if tr < now() %}{% set tr = tr + timedelta(days=1) %}{% endif %}
+            {% set st = tr - timedelta(minutes=duration) %}
+            {{ now() >= st and now() < tr }}
+          {% endif %}
     actions:
       - action: switch.turn_on
         target: { entity_id: switch.ZASUVKA }
       - action: notify.MUJ_TELEFON
         data:
           title: "⚡ Nabíjení zahájeno (plán)"
-          message: "Cíl {{ states('input_number.ev_soc_target') }} %, hotovo v {{ states('input_datetime.ev_ready_time')[:5] }}"
+          message: "Cíl {{ states('input_number.ev_soc_target') }} %, hotovo v {{ states('input_datetime.ev_ready_time')[:5] }} (odhad {{ states('sensor.ev_duration_text') }})"
       - action: tts.speak
         target: { entity_id: tts.MUJ_TTS }
         data:
@@ -692,15 +723,17 @@ automation:
       - condition: state
         entity_id: input_boolean.ev_finish_to_100
         state: "off"
-      - condition: numeric_state
-        entity_id: sensor.ev_session_delivered_kwh
-        above: 0.1
+      # v1.4: nereagovat na výpadek zásuvky (unavailable -> off), jen na skutečné vypnutí
+      - condition: template
+        alias: "Jen když předchozí stav zásuvky byl on"
+        value_template: "{{ trigger.from_state is not none and trigger.from_state.state == 'on' }}"
     actions:
       - variables:
+          delivered: "{{ states('sensor.ev_session_delivered_kwh') | float(0) }}"
           committed: >-
             {% set cfg = 'sensor.ev_config' %}
             {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
-            {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.92) %}
+            {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
             {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
             {% set start = states('input_number.ev_soc_current') | float(0) %}
             {% set pct = batt / 100 %}
@@ -715,13 +748,153 @@ automation:
             {% endif %}
             {% if ns.rem > 0 %}{% set ns.added = ns.added + ns.rem * eff_hi / pct %}{% endif %}
             {{ [start + ns.added, 100] | min | round(0) }}
-      - action: input_number.set_value
-        target: { entity_id: input_number.ev_soc_current }
-        data: { value: "{{ committed }}" }
+      # v1.4: commit jen když je co uložit, ALE režim Off se nastaví vždy.
+      # Dřív podmínka delivered > 0.1 zablokovala celou automatizaci; režim zůstal
+      # Scheduled a "EV start scheduled" zásuvku každou minutu znovu zapínal.
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ delivered > 0.1 }}"
+            sequence:
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_current }
+                data: { value: "{{ committed }}" }
       - action: input_select.select_option
         target: { entity_id: input_select.ev_mode }
         data: { option: "Off" }
       - action: notify.MUJ_TELEFON
         data:
           title: "🔌 Nabíjení ukončeno"
-          message: "Uložen reálný stav {{ committed }} % (dodáno {{ states('sensor.ev_session_delivered_kwh') }} kWh)."
+          message: >-
+            {{ ('Uložen reálný stav ' ~ committed ~ ' % (dodáno ' ~ (delivered | round(2)) ~ ' kWh).')
+               if delivered > 0.1 else 'Nabíjení přerušeno na začátku, SOC neměněn.' }}
+
+  # ===== Off = fyzicky zastavit nabíjení (v1.4) =====
+  # Bez tohohle "Off" jen odzbrojil auto-stop – zásuvka zůstala pod proudem
+  # a failsafe ji do 10 minut zase přihlásil jako aktivní nabíjení.
+  - id: ev_tpl_off_stop
+    alias: EV Off = zastavit nabíjení
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: input_select.ev_mode
+        to: "Off"
+    conditions:
+      # jen když zásuvka svítí – nezasahuje do jiného spotřebiče na téže zásuvce
+      - condition: state
+        entity_id: switch.ZASUVKA
+        state: "on"
+    actions:
+      - variables:
+          delivered: "{{ states('sensor.ev_session_delivered_kwh') | float(0) }}"
+          committed: >-
+            {% set cfg = 'sensor.ev_config' %}
+            {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+            {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
+            {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+            {% set start = states('input_number.ev_soc_current') | float(0) %}
+            {% set pct = batt / 100 %}
+            {% set ns = namespace(added=0, rem=states('sensor.ev_session_delivered_kwh') | float(0)) %}
+            {% if start < 80 %}
+              {% set cap = (80 - start) * pct / eff_lo %}
+              {% if ns.rem <= cap %}
+                {% set ns.added = ns.rem * eff_lo / pct %}{% set ns.rem = 0 %}
+              {% else %}
+                {% set ns.added = 80 - start %}{% set ns.rem = ns.rem - cap %}
+              {% endif %}
+            {% endif %}
+            {% if ns.rem > 0 %}{% set ns.added = ns.added + ns.rem * eff_hi / pct %}{% endif %}
+            {{ [start + ns.added, 100] | min | round(0) }}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ delivered > 0.1 }}"
+            sequence:
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_current }
+                data: { value: "{{ committed }}" }
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.ev_finish_to_100 }
+      # pořadí: nejdřív vypnout zásuvku, režim už Off je – tím se vyhneme
+      # dvojímu commitu přes ev_tpl_commit_soc
+      - action: switch.turn_off
+        target: { entity_id: switch.ZASUVKA }
+      - action: notify.MUJ_TELEFON
+        data:
+          title: "🔌 Nabíjení zastaveno"
+          message: >-
+            {{ ('Uložen reálný stav ' ~ committed ~ ' % (' ~ (delivered | round(2)) ~ ' kWh).')
+               if delivered > 0.1 else 'Zásuvka vypnuta.' }}
+
+  # ===== Konec bez odběru – auto dobito vlastní BMS / vůbec nepřipojené (v1.4) =====
+  # Řeší "zásuvka zůstane napořád zapnutá", když auto přestane brát proud dřív,
+  # než model dopočítá cíl. 20 min je bezpečně za 15min kalibrací u cíle 100 %.
+  - id: ev_tpl_no_draw
+    alias: EV auto-konec bez odběru
+    mode: single
+    triggers:
+      # a) výkon spadl pod práh (auto dobito / odpojeno uprostřed)
+      - trigger: numeric_state
+        entity_id: sensor.ZASUVKA_vykon
+        below: 50
+        for: { minutes: 20 }
+      # b) zásuvka je 20 min zapnutá – chytí i případ, kdy byl výkon plochá nula
+      #    od začátku (auto vůbec nepřipojené) a numeric_state práh nikdy nepřekročil
+      - trigger: state
+        entity_id: switch.ZASUVKA
+        to: "on"
+        for: { minutes: 20 }
+    conditions:
+      - condition: state
+        entity_id: switch.ZASUVKA
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: input_select.ev_mode
+            state: "Off"
+      - condition: numeric_state
+        entity_id: sensor.ZASUVKA_vykon
+        below: 50
+    actions:
+      - variables:
+          delivered: "{{ states('sensor.ev_session_delivered_kwh') | float(0) }}"
+          committed: >-
+            {% set cfg = 'sensor.ev_config' %}
+            {% set batt = state_attr(cfg,'battery_kwh') | float(28) %}
+            {% set eff_lo = state_attr(cfg,'eff_below_80') | float(0.95) %}
+            {% set eff_hi = state_attr(cfg,'eff_above_80') | float(0.80) %}
+            {% set start = states('input_number.ev_soc_current') | float(0) %}
+            {% set pct = batt / 100 %}
+            {% set ns = namespace(added=0, rem=states('sensor.ev_session_delivered_kwh') | float(0)) %}
+            {% if start < 80 %}
+              {% set cap = (80 - start) * pct / eff_lo %}
+              {% if ns.rem <= cap %}
+                {% set ns.added = ns.rem * eff_lo / pct %}{% set ns.rem = 0 %}
+              {% else %}
+                {% set ns.added = 80 - start %}{% set ns.rem = ns.rem - cap %}
+              {% endif %}
+            {% endif %}
+            {% if ns.rem > 0 %}{% set ns.added = ns.added + ns.rem * eff_hi / pct %}{% endif %}
+            {{ [start + ns.added, 100] | min | round(0) }}
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ delivered > 0.1 }}"
+            sequence:
+              - action: input_number.set_value
+                target: { entity_id: input_number.ev_soc_current }
+                data: { value: "{{ committed }}" }
+      - action: input_boolean.turn_off
+        target: { entity_id: input_boolean.ev_finish_to_100 }
+      - action: switch.turn_off
+        target: { entity_id: switch.ZASUVKA }
+      - action: input_select.select_option
+        target: { entity_id: input_select.ev_mode }
+        data: { option: "Off" }
+      - action: notify.MUJ_TELEFON
+        data:
+          title: "🔌 Nabíjení ukončeno"
+          message: >-
+            {{ ('Auto dobito nebo odpojeno – 20 min bez odběru. Uložen reálný stav ' ~ committed ~ ' % (' ~ (delivered | round(2)) ~ ' kWh).')
+               if delivered > 0.1 else 'Zásuvka byla 20 min bez odběru – auto asi není připojené. Vypínám.' }}

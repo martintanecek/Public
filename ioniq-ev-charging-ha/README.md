@@ -92,6 +92,25 @@ efficiency after a couple of charges (see "Fine-tuning" in the guide).
 
 ## 📝 Changelog
 
+- **v1.4 (2026-07-29)** — Robustness pass driven by a full walkthrough of ~35 real-world scenarios
+  (wrong input, manual intervention mid-charge, power cut, car stopping on its own, HA restart).
+  Four holes closed, two new automations:
+  - **`Off` now physically stops charging.** Before, switching the mode to `Off` only disarmed the
+    auto-stop — the plug stayed energised and the failsafe re-armed it within 10 minutes. New
+    `ev_tpl_off_stop` commits the real SOC and cuts power.
+  - **New no-draw watchdog (`ev_tpl_no_draw`).** If the car's own BMS finishes before the kWh model
+    does — or the car was never plugged in — the plug used to stay on forever. Now 20 minutes below
+    50 W closes the session. It triggers both on the power dropping *and* on the plug simply having
+    been on for 20 minutes, because a `numeric_state` trigger only fires when the value **crosses**
+    the threshold: a plug reporting a flat zero from the start would never have fired it.
+  - **Scheduled start uses a window** (`planned_start .. ready`) plus a `homeassistant.start`
+    trigger, instead of matching one exact minute. A missed start is now caught up immediately.
+  - **No more false commit on a plug dropout.** `ev_tpl_commit_soc` requires the previous state to
+    have been `on`, so an `unavailable -> off` blip no longer ends the session. It also always falls
+    back to mode `Off`; the old `delivered > 0.1` condition could leave the mode at `Scheduled`,
+    and the windowed start would then switch the plug back on every minute.
+  - Consistency: the CZ template used a `0.92` efficiency fallback where EN used `0.95` — both now
+    match the documented `eff_below_80` of `0.95`.
 - **v1.3 (2026-07-07)** — Fix: removed `initial:` from `ev_mode`, `ev_soc_target` and the price
   helper so mode, target and price **survive an HA restart**. Previously a restart mid-charge reset
   the mode to `Off` and the target to 80 %, silently cancelling a scheduled 100 %-by-departure
